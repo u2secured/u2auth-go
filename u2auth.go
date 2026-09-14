@@ -89,6 +89,23 @@ type PairingCode struct {
 type PushOptions struct {
 	WebhookURL string `json:"webhook_url,omitempty"`
 	TTL        int    `json:"ttl,omitempty"`
+	// IdempotencyKey collapses a repeated RequestPush into the ORIGINAL
+	// approval instead of sending the user a second notification. It travels
+	// as the Idempotency-Key HTTP header, never in the body — hence json:"-".
+	//
+	// The key must be stable across the retry, so the SDK cannot invent one
+	// for you: derive it from whatever identifies the attempt in your system.
+	// A nonce rendered into the login form works well, because a double-click
+	// and a back-then-resubmit both carry the same one while a fresh page load
+	// mints a new one.
+	//
+	// This is not Stripe-style idempotency: there is no fixed replay window.
+	// The server frees the key once the approval is approved, denied or
+	// expired, so a genuine retry after that mints a new request rather than
+	// replaying the old one. A key held by a live approval for a DIFFERENT
+	// request returns *APIError with Code "IDEMPOTENCY_KEY_REUSED"; one longer
+	// than 255 characters returns Code "INVALID_IDEMPOTENCY_KEY".
+	IdempotencyKey string `json:"-"`
 }
 
 // VerifyTOTP verifies a TOTP code against a shared secret.
@@ -118,8 +135,13 @@ func (c *Client) RequestPush(userIdentifier, context string, opts *PushOptions) 
 			body["ttl"] = opts.TTL
 		}
 	}
+	var headers map[string]string
+	if opts != nil && opts.IdempotencyKey != "" {
+		headers = map[string]string{"Idempotency-Key": opts.IdempotencyKey}
+	}
+
 	var result PushResult
-	if err := c.post("/api/v1/sdk/push/request", body, &result); err != nil {
+	if err := c.postWithHeaders("/api/v1/sdk/push/request", body, headers, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -268,6 +290,13 @@ func (c *Client) ListEnrolmentEvents(enrolmentID string, limit int, cursor strin
 }
 
 func (c *Client) post(path string, body interface{}, out interface{}) error {
+	return c.postWithHeaders(path, body, nil, out)
+}
+
+// postWithHeaders is post plus caller-supplied headers. An empty value is
+// skipped rather than sent blank: the server distinguishes a present-but-empty
+// Idempotency-Key from an absent one.
+func (c *Client) postWithHeaders(path string, body interface{}, headers map[string]string, out interface{}) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("u2auth: marshal request: %w", err)
@@ -277,6 +306,11 @@ func (c *Client) post(path string, body interface{}, out interface{}) error {
 		return fmt.Errorf("u2auth: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
+	}
 	return c.do(req, out)
 }
 

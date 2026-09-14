@@ -391,3 +391,50 @@ func TestListEnrolmentEvents(t *testing.T) {
 		t.Errorf("event without a fix: place = %+v, want nil", page.Items[1].Place)
 	}
 }
+
+// The Idempotency-Key is an HTTP HEADER, not a body field. A key that leaks
+// into the JSON body is silently ignored by the server — the retry it was meant
+// to collapse sends the user a second push, and nothing fails loudly.
+func TestRequestPush_IdempotencyKeyIsSentAsAHeader(t *testing.T) {
+	var gotHeader string
+	var gotBody map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("Idempotency-Key")
+		json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"approval_id": "apr_1", "status": "pending"})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	_, err := c.RequestPush("user@example.com", "Login", &PushOptions{IdempotencyKey: "nonce-123"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotHeader != "nonce-123" {
+		t.Errorf("Idempotency-Key header = %q, want %q", gotHeader, "nonce-123")
+	}
+	if _, leaked := gotBody["idempotency_key"]; leaked {
+		t.Error("idempotency_key leaked into the request body; it must be a header only")
+	}
+}
+
+// Omitting the key must not send an empty header: the server treats a present
+// but blank Idempotency-Key differently from an absent one.
+func TestRequestPush_NoIdempotencyKeySendsNoHeader(t *testing.T) {
+	var present bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.Header["Idempotency-Key"]
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"approval_id": "apr_1", "status": "pending"})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.RequestPush("user@example.com", "Login", &PushOptions{TTL: 60}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if present {
+		t.Error("Idempotency-Key header was sent despite no key being supplied")
+	}
+}

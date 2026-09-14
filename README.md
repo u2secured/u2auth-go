@@ -53,7 +53,7 @@ Calls `POST /api/v1/sdk/totp/verify`. Returns `VerifyResult{Valid bool}`.
 func (c *Client) RequestPush(userIdentifier, context string, opts *PushOptions) (*PushResult, error)
 ```
 
-Calls `POST /api/v1/sdk/push/request`. `PushOptions` fields: `WebhookURL`, `TTL` (seconds).
+Calls `POST /api/v1/sdk/push/request`. `PushOptions` fields: `WebhookURL`, `TTL` (seconds), `IdempotencyKey`.
 Returns `PushResult{ApprovalID, Status, ExpiresAt}`.
 
 `userIdentifier` matching is case-sensitive and otherwise unnormalised — it's your own key into
@@ -107,6 +107,28 @@ for {
 ### Error Handling
 
 API errors return `*APIError` with `StatusCode`, `Code`, and `Message` fields.
+
+Pass the idempotency option to suppress duplicate requests. While the approval is
+still pending, repeating the call with the same key returns the original — same
+`ApprovalID`, same `MatchNumber`, and no second notification:
+
+```go
+push, err := client.RequestPush("user@example.com", "Login from Chrome",
+    &u2auth.PushOptions{IdempotencyKey: formNonce})
+```
+
+The key frees itself once the approval is approved, denied or expired, so a
+genuine retry after that mints a new request. This is **not** Stripe-style
+idempotency: there is no fixed replay window and no stored-response replay.
+
+The key must be stable across the retry, so the SDK cannot invent one for you: a
+key minted inside the call is a new key every call and protects nothing. Mint a
+nonce when the login form is rendered and carry it in a hidden field — a
+double-click and a back-then-resubmit both send the same one, while a fresh page
+load mints a new one.
+
+Reusing a live key for a different request raises `*APIError` with code `IDEMPOTENCY_KEY_REUSED`; a key over
+255 characters raises `INVALID_IDEMPOTENCY_KEY`.
 
 ## Verifying webhooks
 
