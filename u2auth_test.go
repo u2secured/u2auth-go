@@ -357,6 +357,44 @@ func TestListEnrolments_EmptyOptionsOmitsOptionalParams(t *testing.T) {
 	}
 }
 
+// Contract behaviour: Limit <= 0 is treated as unset and omitted from the
+// query, same as Node (client.test.ts) and Python (test_client.py) pin for
+// their own SDKs. Zero and negative are pinned as two separate cases — they
+// reach "omitted" for different reasons in a reader's head (zero is the Go
+// zero value / "never set"; negative is an explicit but out-of-range value)
+// even though the code path is one `> 0` check either way.
+func TestListEnrolments_ZeroLimitOmitsLimitFromQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("limit") {
+			t.Errorf("limit must be omitted when Limit is 0, got %q", r.URL.Query().Get("limit"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolments(&ListEnrolmentsOptions{Limit: 0}); err != nil {
+		t.Fatalf("ListEnrolments: %v", err)
+	}
+}
+
+func TestListEnrolments_NegativeLimitOmitsLimitFromQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("limit") {
+			t.Errorf("limit must be omitted when Limit is negative, got %q", r.URL.Query().Get("limit"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolments(&ListEnrolmentsOptions{Limit: -1}); err != nil {
+		t.Fatalf("ListEnrolments: %v", err)
+	}
+}
+
 func TestListEnrolmentEvents(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/sdk/enrolments/e1/events" {
@@ -389,6 +427,72 @@ func TestListEnrolmentEvents(t *testing.T) {
 	// need to tell "unknown" from a blank city.
 	if page.Items[1].Place != nil {
 		t.Errorf("event without a fix: place = %+v, want nil", page.Items[1].Place)
+	}
+}
+
+// ListEnrolmentEvents has its own `limit > 0` guard (u2auth.go), separate from
+// ListEnrolments', and until now nothing exercised the omission path for it at
+// all — TestListEnrolmentEvents above only ever passes limit=10. Zero and
+// negative are pinned as two cases for the same reason as on ListEnrolments:
+// they reach "omitted" for different reasons in a reader's head, and a
+// zero-only test would still pass against a guard written `if limit != 0`,
+// which would send -1.
+func TestListEnrolmentEvents_ZeroLimitOmitsLimitFromQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("limit") {
+			t.Errorf("limit must be omitted when limit is 0, got %q", r.URL.Query().Get("limit"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolmentEvents("e1", 0, ""); err != nil {
+		t.Fatalf("ListEnrolmentEvents: %v", err)
+	}
+}
+
+func TestListEnrolmentEvents_NegativeLimitOmitsLimitFromQuery(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("limit") {
+			t.Errorf("limit must be omitted when limit is negative, got %q", r.URL.Query().Get("limit"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolmentEvents("e1", -1, ""); err != nil {
+		t.Fatalf("ListEnrolmentEvents: %v", err)
+	}
+}
+
+// The enrolment id lands in a URL path segment, so it must be escaped there —
+// the same way GetPairingCodeStatus already escapes the pairing code with
+// url.PathEscape. Before this was fixed the id was interpolated raw, so an id
+// carrying a space or a slash produced a different request target than the
+// caller asked for (a slash silently splits the segment and reaches another
+// resource entirely). RequestURI is read rather than URL.Path because the
+// latter is already percent-decoded and would hide the bug.
+func TestListEnrolmentEvents_EscapesEnrolmentIDInPath(t *testing.T) {
+	var gotRequestURI string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequestURI = r.RequestURI
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolmentEvents("en 1/2", 0, ""); err != nil {
+		t.Fatalf("ListEnrolmentEvents: %v", err)
+	}
+
+	want := "/api/v1/sdk/enrolments/en%201%2F2/events"
+	if gotRequestURI != want {
+		t.Errorf("request target = %q, want %q", gotRequestURI, want)
 	}
 }
 
@@ -436,5 +540,147 @@ func TestRequestPush_NoIdempotencyKeySendsNoHeader(t *testing.T) {
 	}
 	if present {
 		t.Error("Idempotency-Key header was sent despite no key being supplied")
+	}
+}
+
+// Not linked is (nil, nil), not an error: at login it is the normal answer,
+// and making callers inspect an error on the common path is how integrations
+// end up swallowing real ones too.
+func TestGetEnrolmentReturnsNilWhenNotLinked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("user_identifier"); got != "ada@example.com" {
+			t.Errorf("user_identifier = %q, want ada@example.com", got)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}, "next_cursor": ""})
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	e, err := c.GetEnrolment("ada@example.com")
+	if err != nil {
+		t.Fatalf("GetEnrolment: %v", err)
+	}
+	if e != nil {
+		t.Errorf("GetEnrolment = %+v, want nil", e)
+	}
+}
+
+func TestGetEnrolmentReturnsEnrolmentWhenLinked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("user_identifier") != "ada@example.com" {
+			t.Errorf("user_identifier = %q", q.Get("user_identifier"))
+		}
+		if q.Get("limit") != "1" {
+			t.Errorf("limit = %q, want 1", q.Get("limit"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[{"id":"e1","user_identifier":"ada@example.com","created_at":"2026-08-01T10:00:00Z","last_auth_at":null,"last_auth_outcome":null,"push_ready":true}],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	e, err := c.GetEnrolment("ada@example.com")
+	if err != nil {
+		t.Fatalf("GetEnrolment: %v", err)
+	}
+	if e == nil {
+		t.Fatal("GetEnrolment = nil, want an enrolment")
+	}
+	if e.ID != "e1" || !e.PushReady {
+		t.Errorf("enrolment = %+v", e)
+	}
+}
+
+// user_identifier is an arbitrary developer-chosen string, unlike
+// cursor/sort/order, so it must be genuinely absent from the query when
+// unset rather than sent as an empty value.
+func TestListEnrolments_UserIdentifierOmittedWhenEmpty(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("user_identifier") {
+			t.Errorf("user_identifier must be omitted when unset, got %q", r.URL.Query().Get("user_identifier"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolments(&ListEnrolmentsOptions{}); err != nil {
+		t.Fatalf("ListEnrolments: %v", err)
+	}
+}
+
+func TestListEnrolments_UserIdentifierIncludedWhenSet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.URL.Query().Get("user_identifier"); got != "alice@acme.com" {
+			t.Errorf("user_identifier = %q, want alice@acme.com", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":""}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	if _, err := c.ListEnrolments(&ListEnrolmentsOptions{UserIdentifier: "alice@acme.com"}); err != nil {
+		t.Fatalf("ListEnrolments: %v", err)
+	}
+}
+
+func TestGetPairingCodeStatus_Pending(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sdk/pairing-codes/af17-b500" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"pending"}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	st, err := c.GetPairingCodeStatus("af17-b500")
+	if err != nil {
+		t.Fatalf("GetPairingCodeStatus: %v", err)
+	}
+	if st.Status != "pending" || st.EnrolmentID != "" {
+		t.Errorf("status = %+v", st)
+	}
+}
+
+func TestGetPairingCodeStatus_Redeemed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"redeemed","enrolment_id":"e1"}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	st, err := c.GetPairingCodeStatus("af17-b500")
+	if err != nil {
+		t.Fatalf("GetPairingCodeStatus: %v", err)
+	}
+	if st.Status != "redeemed" || st.EnrolmentID != "e1" {
+		t.Errorf("status = %+v", st)
+	}
+}
+
+// A code that never existed and one belonging to another app must BOTH
+// report "expired" — distinguishing them would make the endpoint a probing
+// oracle. The client must surface the server's value verbatim, not attempt
+// to tell the two apart itself (it has nothing in the payload to do so with).
+func TestGetPairingCodeStatus_UnknownOrOtherAppCodeReadsExpired(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"expired"}`))
+	}))
+	defer srv.Close()
+
+	c := newTestClient(srv)
+	st, err := c.GetPairingCodeStatus("never-existed")
+	if err != nil {
+		t.Fatalf("GetPairingCodeStatus: %v", err)
+	}
+	if st.Status != "expired" {
+		t.Errorf("status = %+v, want expired", st)
 	}
 }

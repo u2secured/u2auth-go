@@ -22,7 +22,7 @@ push, err := client.RequestPush("user@example.com", "Login from Chrome", nil)
 // Poll status
 status, err := client.GetPushStatus(push.ApprovalID)
 
-// Generate a secret + URI for enrollment
+// Generate a secret + URI for enrolment
 secret, _ := u2auth.GenerateSecret(20)
 uri := u2auth.GenerateQRCodeURI("MyApp", "user@example.com", secret, nil)
 ```
@@ -91,7 +91,9 @@ Calls `GET /api/v1/sdk/enrolments` and `GET /api/v1/sdk/enrolments/{enrolmentId}
 
 `ListEnrolmentsOptions` fields: `Limit`, `Cursor`, `Sort` (`"created_at"` | `"user_identifier"` | `"last_auth_at"`), `Order` (`"asc"` | `"desc"`). `Limit` (also the plain `limit int` parameter on `ListEnrolmentEvents`) `<= 0` is treated as unset and omitted from the query, same as an empty `Cursor`/`Sort`/`Order`; a value outside `1..100` returns an `*APIError` with Code `"INVALID_LIMIT"`. A page's `NextCursor` is opaque and bound to the `Sort`/`Order` that minted it — pass it back verbatim; replaying it under a different `Sort`/`Order` returns an `*APIError` with Code `"INVALID_CURSOR"`.
 
-For an enrolment that has never authenticated, `LastAuthAt` and `LastAuthOutcome` are both `nil` rather than a zero time / empty string. An `EnrolmentEvent`'s `Place` is a coarse, city-level location (never a coordinate) and is `nil` when no fix was captured.
+For an enrolment that has never authenticated, `LastAuthAt` and `LastAuthOutcome` are both `nil` rather than a zero time / empty string. An `EnrolmentEvent`'s `Place` is a coarse, city-level location (never a coordinate) and is `nil` when no fix was captured. `Enrolment.PushReady` reports whether the linked device can currently receive a push (a confirmed device is enrolled) — check it before calling `RequestPush` if you want to route a not-ready user to a different second factor instead.
+
+`ListEnrolmentsOptions` also takes `UserIdentifier` to filter to one developer-chosen identifier. It is an arbitrary caller string, not an opaque token like `Cursor` or a fixed enum like `Sort`/`Order`, so it is included whenever non-empty — there is no reserved "unset" value to trip over.
 
 ```go
 cursor := ""
@@ -103,6 +105,105 @@ for {
     cursor = page.NextCursor
 }
 ```
+
+### Linked approvals
+
+"Linked approvals" is link-then-push: a user links their phone to *your* account once (via a
+pairing code), and afterwards you call `RequestPush` directly against their `userIdentifier` — no
+code re-entry required.
+
+```go
+// 1. Mint a code and show it to the signed-in user (e.g. as text + a QR code).
+pairing, err := client.CreatePairingCode("user@example.com")
+// pairing.Code == "af17-b500", pairing.ExpiresAt == "2026-09-15T10:10:00Z"
+
+// 2. The user opens the U2 Secured app and redeems the code there. Poll its
+//    status from wherever the user is waiting (e.g. the browser via your own
+//    endpoint) — see the WaitForLink warning below before calling it from a
+//    request a user's browser is blocked on.
+status, err := client.GetPairingCodeStatus(pairing.Code)
+// status.Status is "pending" | "redeemed" | "expired"; status.EnrolmentID is
+// set once redeemed.
+
+// 3. Once redeemed, the identifier is linked. From then on, request push
+//    directly — no pairing code involved.
+push, err := client.RequestPush("user@example.com", "Login from Chrome", nil)
+```
+
+#### GetEnrolment
+
+```go
+func (c *Client) GetEnrolment(userIdentifier string) (*Enrolment, error)
+```
+
+Looks up this app's enrolment for one user identifier. **Returns `(nil, nil)` when the user is not
+linked — it never returns an error for that case.** At login, "this user has not linked a phone" is
+the normal answer, not an error; forcing every caller to branch on an error for the common path is
+how integrations end up swallowing real errors too. This is deliberately unlike `DeleteEnrolment`,
+where the absence genuinely is the anomaly and it returns `*APIError` with Code
+`"ENROLMENT_NOT_FOUND"`.
+
+```go
+enrolment, err := client.GetEnrolment("user@example.com")
+if err != nil {
+    return err
+}
+if enrolment == nil {
+    // show a "link your phone" prompt
+} else if enrolment.PushReady {
+    push, err := client.RequestPush("user@example.com", "Login from Chrome", nil)
+}
+```
+
+#### GetPairingCodeStatus
+
+```go
+func (c *Client) GetPairingCodeStatus(code string) (*PairingCodeStatus, error)
+```
+
+Calls `GET /api/v1/sdk/pairing-codes/{code}`. Returns `PairingCodeStatus{Status, EnrolmentID}`,
+where `Status` is `"pending"`, `"redeemed"` or `"expired"`. A code that never existed, and one
+belonging to another app, both read as `"expired"` — distinguishing them would make the endpoint a
+probing oracle. This is the call to poll from wherever the user is waiting.
+
+#### WaitForLink
+
+```go
+func (c *Client) WaitForLink(ctx context.Context, code string, opts *WaitForLinkOptions) (*Enrolment, error)
+```
+
+Blocking convenience helper that mirrors `WaitForApproval` — same options shape, same polling
+structure — so a developer who has used one can use the other without re-reading the docs. Polls
+`GetPairingCodeStatus` until the code is redeemed, then fetches and returns the resulting
+**enrolment** (not just the status — that's why `UserIdentifier` is required: the status response
+alone doesn't carry enough to look the enrolment up).
+
+`WaitForLinkOptions` fields:
+
+| field | type | default | notes |
+|---|---|---|---|
+| `UserIdentifier` | `string` | — | **Required.** The identifier the code was minted for. Returns `*APIError` with Code `"MISSING_USER_IDENTIFIER"` if empty — never silently ignored. |
+| `Interval` | `time.Duration` | `2s` | Poll interval. Zero or negative takes the default. |
+| `Timeout` | `time.Duration` | `2m` | Give up after this long. Zero or negative takes the default. |
+
+Returns `*APIError` with Code `"PAIRING_CODE_EXPIRED"` if the code lapses before redemption,
+`"LINK_TIMEOUT"` if the deadline passes while it's still pending, or `"ENROLMENT_NOT_FOUND"` if the
+code comes back redeemed but no matching enrolment can be found for `UserIdentifier` — rare but
+reachable, since redemption and the enrolment lookup are two separate backend calls. Cancelling
+`ctx` returns `ctx.Err()`.
+
+```go
+enrolment, err := client.WaitForLink(ctx, pairing.Code, &u2auth.WaitForLinkOptions{
+    UserIdentifier: "user@example.com",
+})
+```
+
+> **This blocks the calling goroutine, exactly like `WaitForApproval`.** Never call it from an HTTP
+> handler a user's browser is waiting on — a normal request has nowhere near a 2-minute budget, and
+> tying up a handler goroutine for the whole poll will exhaust your server under modest traffic.
+> Reach for `WaitForLink` only from something that already owns a long-lived context (a CLI, a
+> background job, a queue worker); poll `GetPairingCodeStatus` from the browser on an interval
+> instead for anything request-driven.
 
 ### Error Handling
 

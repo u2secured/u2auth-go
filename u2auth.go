@@ -193,6 +193,15 @@ type Enrolment struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	LastAuthAt      *time.Time `json:"last_auth_at"`
 	LastAuthOutcome *string    `json:"last_auth_outcome"`
+	PushReady       bool       `json:"push_ready"`
+}
+
+// PairingCodeStatus is where a pairing code sits in its lifecycle. A code that
+// never existed and one belonging to another app both report "expired":
+// distinguishing them would make the endpoint a probing oracle.
+type PairingCodeStatus struct {
+	Status      string `json:"status"`
+	EnrolmentID string `json:"enrolment_id,omitempty"`
 }
 
 // EnrolmentEvent is a single authentication attempt recorded against an
@@ -228,11 +237,18 @@ type ListEnrolmentsOptions struct {
 	Cursor string
 	Sort   string // "created_at" | "user_identifier" | "last_auth_at"
 	Order  string // "asc" | "desc"
+	// UserIdentifier filters to one developer-chosen identifier. Unlike
+	// Cursor/Sort/Order it is an arbitrary caller string rather than an
+	// opaque token or a fixed enum, so an empty string is the only value
+	// treated as unset — there is no equivalent of PHP's empty() trap in Go,
+	// so a plain != "" check is all that is needed.
+	UserIdentifier string
 }
 
 // ListEnrolments lists the enrolments for this app. The app is resolved from
 // the API key — there is no app id parameter. Limit <= 0 is treated as
-// unset and omitted from the query, same as an empty Cursor/Sort/Order.
+// unset and omitted from the query, same as an empty Cursor/Sort/Order/
+// UserIdentifier.
 // Returns an *APIError with Code "INVALID_LIMIT" if Limit is outside 1..100,
 // "INVALID_SORT" for an unrecognised Sort, or "INVALID_CURSOR" if Cursor was
 // minted under a different Sort/Order.
@@ -251,6 +267,9 @@ func (c *Client) ListEnrolments(opts *ListEnrolmentsOptions) (*EnrolmentPage, er
 		if opts.Order != "" {
 			q.Set("order", opts.Order)
 		}
+		if opts.UserIdentifier != "" {
+			q.Set("user_identifier", opts.UserIdentifier)
+		}
 	}
 	path := "/api/v1/sdk/enrolments"
 	if len(q) > 0 {
@@ -261,6 +280,37 @@ func (c *Client) ListEnrolments(opts *ListEnrolmentsOptions) (*EnrolmentPage, er
 		return nil, err
 	}
 	return &result, nil
+}
+
+// GetEnrolment looks up this app's enrolment for one user identifier.
+//
+// Returns (nil, nil) when the user is not linked. That is deliberately not an
+// error: at login "not linked" is the normal answer, and making callers
+// inspect an error on the common path is how integrations end up swallowing
+// real ones too.
+func (c *Client) GetEnrolment(userIdentifier string) (*Enrolment, error) {
+	page, err := c.ListEnrolments(&ListEnrolmentsOptions{
+		UserIdentifier: userIdentifier,
+		Limit:          1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(page.Items) == 0 {
+		return nil, nil
+	}
+	return &page.Items[0], nil
+}
+
+// GetPairingCodeStatus reads where a pairing code is in its lifecycle:
+// pending, redeemed or expired. A code that never existed and one belonging
+// to another app both read as expired.
+func (c *Client) GetPairingCodeStatus(code string) (*PairingCodeStatus, error) {
+	var out PairingCodeStatus
+	if err := c.get("/api/v1/sdk/pairing-codes/"+url.PathEscape(code), &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // ListEnrolmentEvents lists the authentication events for one enrolment.
@@ -278,7 +328,10 @@ func (c *Client) ListEnrolmentEvents(enrolmentID string, limit int, cursor strin
 	if cursor != "" {
 		q.Set("cursor", cursor)
 	}
-	path := fmt.Sprintf("/api/v1/sdk/enrolments/%s/events", enrolmentID)
+	// PathEscape, matching GetPairingCodeStatus: an enrolment id is a server
+	// -minted opaque string, but it is interpolated into a path segment, so
+	// escape it rather than trusting its shape.
+	path := "/api/v1/sdk/enrolments/" + url.PathEscape(enrolmentID) + "/events"
 	if len(q) > 0 {
 		path += "?" + q.Encode()
 	}
