@@ -684,3 +684,18 @@ func TestGetPairingCodeStatus_UnknownOrOtherAppCodeReadsExpired(t *testing.T) {
 		t.Errorf("status = %+v, want expired", st)
 	}
 }
+
+// The default base URL is a security boundary, not a convenience: a client
+// built without BaseURL sends the caller's rka_ key to whatever this names.
+// It named https://app.u2secured.io through v0.3.0 -- a domain nobody had
+// registered, so any stranger could have bought it and collected keys from
+// every integration that took the default. No test referenced the constant,
+// so nothing noticed.
+//
+// The literal is asserted rather than the constant against itself, which
+// would pass whatever the constant said.
+func TestDefaultBaseURLIsTheProductionHost(t *testing.T) {
+	if defaultBaseURL != "https://auth.u2secured.com" {
+		t.Fatalf("default base URL = %q, want https://auth.u2secured.com", defaultBaseURL)
+	}
+}

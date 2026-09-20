@@ -36,7 +36,7 @@ func NewClient(apiKey string, opts *ClientOptions) *Client
 ```
 
 `ClientOptions`:
-- `BaseURL string` — override API base URL (default: `https://app.u2secured.io`)
+- `BaseURL string` — override API base URL (default: `https://auth.u2secured.com`)
 - `HTTPClient *http.Client` — custom HTTP client
 
 ### VerifyTOTP

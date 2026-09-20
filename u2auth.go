@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const defaultBaseURL = "https://app.u2secured.io"
+const defaultBaseURL = "https://auth.u2secured.com"
 
 // ClientOptions allows customising the U2Auth client.
 type ClientOptions struct {
